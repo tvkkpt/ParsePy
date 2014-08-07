@@ -84,7 +84,7 @@ class ParseBase(object):
         request.add_header('X-Parse-Application-Id', app_id)
         request.add_header('X-Parse-REST-API-Key', rest_key)
 
-        if master_key and 'X-Parse-Session-Token' not in headers.keys():
+        if master_key: # and 'X-Parse-Session-Token' not in headers.keys():
             request.add_header('X-Parse-Master-Key', master_key)
 
         request.get_method = lambda: http_verb
