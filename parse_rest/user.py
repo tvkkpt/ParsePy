@@ -22,7 +22,7 @@ def login_required(func):
     '''decorator describing User methods that need to be logged in'''
     def ret(obj, *args, **kw):
         conn = ACCESS_KEYS
-        if not (conn and conn.get('master_key')):
+        if conn and conn.get('master_key'):
             obj.sessionToken = 'FOO-TOKEN'
 
         if not hasattr(obj, 'sessionToken'):
