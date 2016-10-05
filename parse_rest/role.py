@@ -12,29 +12,28 @@
 #    along with this program.  If not, see <http://www.gnu.org/licenses/>.
 
 
-class ParseError(Exception):
-    '''Base exceptions from requests made to Parse'''
-    pass
-
-class ParseBatchError(Exception):
-    ''' Error in batching operation... should take a list. '''
-    pass
-
-class ResourceRequestBadRequest(ParseError):
-    '''Request returns a 400'''
-    pass
+from parse_rest.connection import API_ROOT
+from parse_rest.datatypes import Object
+from parse_rest.query import QueryManager
 
 
-class ResourceRequestLoginRequired(ParseError):
-    '''Request returns a 401'''
-    pass
+class Role(Object):
+    '''
+    A Role is like a regular Parse object (can be modified and saved) but
+    it requires additional methods and functionality
+    '''
+    ENDPOINT_ROOT = '/'.join([API_ROOT, 'roles'])
+
+    @property
+    def className(self):
+        return '_Role'
+
+    def __repr__(self):
+        return '<Role:%s (Id %s)>' % (getattr(self, 'name', None), self.objectId)
+
+    @classmethod
+    def set_endpoint_root(cls):
+        return cls.ENDPOINT_ROOT
 
 
-class ResourceRequestForbidden(ParseError):
-    '''Request returns a 403'''
-    pass
-
-
-class ResourceRequestNotFound(ParseError):
-    '''Request returns a 404'''
-    pass
+Role.Query = QueryManager(Role)

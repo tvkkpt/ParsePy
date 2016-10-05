@@ -14,10 +14,12 @@ from __future__ import unicode_literals
 
 import base64
 import datetime
+import mimetypes
 import six
 
 from parse_rest.connection import API_ROOT, ParseBase
 from parse_rest.query import QueryManager
+from parse_rest.core import ParseError
 
 
 def complex_type(name=None):
@@ -32,15 +34,22 @@ class ParseType(object):
     type_mapping = {}
 
     @staticmethod
-    def convert_from_parse(parse_data):
+    def convert_from_parse(parse_key, parse_data):
+        if isinstance(parse_data, list):
+            return [ParseType.convert_from_parse(parse_key, item) for item in parse_data]
 
-        is_parse_type = isinstance(parse_data, dict) and '__type' in parse_data
+        parse_type = None
+        if isinstance(parse_data, dict):
+            if '__type' in parse_data:
+                parse_type = parse_data.pop('__type')
+            elif parse_key == 'ACL':
+                parse_type = 'ACL'
 
         # if its not a parse type -- simply return it. This means it wasn't a "special class"
-        if not is_parse_type:
+        if not parse_type:
             return parse_data
 
-        native = ParseType.type_mapping.get(parse_data.pop('__type'))
+        native = ParseType.type_mapping.get(parse_type)
         return  native.from_native(**parse_data) if native else parse_data
 
     @staticmethod
@@ -59,6 +68,17 @@ class ParseType(object):
             datetime.datetime: Date,
             ParseResource: Pointer
         }
+
+        if (hasattr(python_object, '__iter__') and
+            not isinstance(python_object, (six.string_types[0], ParseType))):
+            # It's an iterable? Repeat this whole process on each object
+            if isinstance(python_object, dict):
+                for key, value in python_object.items():
+                    python_object[key]=ParseType.convert_to_parse(value, as_pointer=as_pointer)
+                return python_object
+            else:
+                return [ParseType.convert_to_parse(o, as_pointer=as_pointer)
+                    for o in python_object]
 
         if python_type in transformation_map:
             klass = transformation_map.get(python_type)
@@ -110,7 +130,109 @@ class EmbeddedObject(ParseType):
 class Relation(ParseType):
     @classmethod
     def from_native(cls, **kw):
-        pass
+        return cls(**kw)
+
+    def with_parent(self, **kw):
+        """The parent calls this if the Relation already exists."""
+        if 'parentObject' in kw:
+            self.parentObject = kw['parentObject']
+            self.key = kw['key']
+        return self
+
+    def __init__(self, **kw):
+        """Called either via Relation(), or via from_native().
+        In both cases, the Relation object cannot perform
+        queries until we know what classes are on both sides
+        of the relation.
+
+        If it's called via from_native, then a later call to
+        with_parent() provides parent information.
+
+        If it's called as Relation(), the relatedClassName is
+        discovered either on the first added object, or
+        by querying the server to retrieve the schema.
+        """
+        # Name of the key on the parent object.
+        self.key = None
+        self.parentObject = None
+        self.relatedClassName = None
+
+        # Called via from_native()
+        if 'className' in kw:
+            self.relatedClassName = kw['className']
+
+        # Called via Relation(...)
+        if 'parentObject' in kw:
+            self.parentObject = kw['parentObject']
+            self.key = kw['key']
+
+    def __repr__(self):
+        className = objectId = None
+        if self.parentObject is not None:
+            className = self.parentObject.className
+            objectId = self.parentObject.objectId
+        repr = u'<Relation where %s:%s for %s>' % \
+            (className,
+             objectId,
+             self.relatedClassName)
+        return repr
+
+    def _to_native(self):
+        return {
+            '__type': 'Relation',
+            'className': self.relatedClassName
+        }
+
+    def add(self, objs):
+        """Adds a Parse.Object or an array of Parse.Objects to the relation."""
+        if type(objs) is not list:
+            objs = [objs]
+        if self.relatedClassName is None:
+            # find the related class from the first object added
+            self.relatedClassName = objs[0].className
+            setattr(self.parentObject, self.key, self)
+        objectsId = []
+        for obj in objs:
+            if not hasattr(obj, 'objectId') or obj.objectId is None:
+                obj.save()
+            objectsId.append(obj.objectId)
+        self.parentObject.addRelation(self.key,
+                                      self.relatedClassName,
+                                      objectsId)
+
+    def remove(self, objs):
+        """Removes an array of, or one Parse.Object from this relation."""
+        if type(objs) is not list:
+            objs = [objs]
+        objectsId = []
+        for obj in objs:
+            if hasattr(obj, 'objectId'):
+                objectsId.append(obj.objectId)
+        self.parentObject.removeRelation(self.key,
+                                         self.relatedClassName,
+                                         objectsId)
+
+    def query(self):
+        """Returns a Parse.Query limited to objects in this relation."""
+        if self.relatedClassName is None:
+            self._probe_for_relation_class()
+        key = '%s__relatedTo' % (self.key,)
+        kw = {key: self.parentObject}
+        relatedClass = Object.factory(self.relatedClassName)
+        q = relatedClass.Query.all().filter(**kw)
+        return q
+
+    def _probe_for_relation_class(self):
+        """Retrive the schema from the server to find related class."""
+        schema = self.parentObject.__class__.schema()
+        fields = schema['fields']
+        relatedColumn = fields[self.key]
+        columnType = relatedColumn['type']
+        if columnType == 'Relation':
+            self.relatedClassName = relatedColumn['targetClass']
+        else:
+            raise ParseError(
+                'Column type is %s, expected Relation' % (columnType,))
 
 
 @complex_type()
@@ -174,32 +296,119 @@ class GeoPoint(ParseType):
 
 
 @complex_type()
-class File(ParseType):
+class File(ParseType, ParseBase):
+    ENDPOINT_ROOT = '/'.join([API_ROOT, 'files'])
 
     @classmethod
     def from_native(cls, **kw):
         return cls(**kw)
 
-    def __init__(self, **kw):
-        name = kw.get('name')
+    def __init__(self, name, content=None, mimetype=None, url=None):
         self._name = name
+        self._file_url = url
         self._api_url = '/'.join([API_ROOT, 'files', name])
-        self._file_url = kw.get('url')
+        self._content = content
+        self._mimetype = mimetype or mimetypes.guess_type(name)
+        if not content and not url:
+            with open(name) as f:
+                content = f.read()
+        self._content = content
+
+    def __repr__(self):
+        return '<File:%s>' % (getattr(self, '_name', None))
 
     def _to_native(self):
         return {
             '__type': 'File',
             'name': self._name,
             'url': self._file_url
-            }
+        }
 
+    def save(self, batch=False):
+        if self.url is not None:
+            raise ParseError("Files can't be overwritten")
+        uri = '/'.join([self.__class__.ENDPOINT_ROOT, self.name])
+        headers = {'Content-type': self.mimetype}
+        response = self.__class__.POST(uri, extra_headers=headers, batch=batch, _body=self._content)
+        self._file_url = response['url']
+        self._name = response['name']
+        self._api_url = '/'.join([API_ROOT, 'files', self._name])
+
+        if batch:
+            return response, lambda response_dict: None
+
+    def delete(self, batch=False):
+        uri = "/".join(self.__class__.ENDPOINT_ROOT, self.name)
+        response = self.__class__.DELETE(uri, batch=batch)
+
+        if batch:
+            return response, lambda response_dict: None
+
+    mimetype = property(lambda self: self._mimetype)
     url = property(lambda self: self._file_url)
     name = property(lambda self: self._name)
     _absolute_url = property(lambda self: self._api_url)
 
 
+@complex_type()
+class ACL(ParseType):
+
+    @classmethod
+    def from_native(cls, **kw):
+        return cls(kw)
+
+    def __init__(self, acl=None):
+        self._acl = acl or {}
+
+    def _to_native(self):
+        return self._acl
+
+    def __repr__(self):
+        return '%s(%s)' % (type(self).__name__, repr(self._acl))
+
+    def set_default(self, read=False, write=False):
+        self._set_permission("*", read, write)
+
+    def set_role(self, role, read=False, write=False):
+        if isinstance(role, ParseResource):
+            self._set_permission("role:%s" % role.name, read, write)
+        else:
+            self._set_permission("role:%s" % role, read, write)
+
+    def set_user(self, user, read=False, write=False):
+        if isinstance(user, ParseResource):
+            self._set_permission(user.objectId, read, write)
+        else:
+            self._set_permission(user, read, write)
+
+    def set_all(self, permissions):
+        self._acl.clear()
+        for k, v in permissions.items():
+            self._set_permission(k, **v)
+
+    def _set_permission(self, name, read=False, write=False):
+        permissions = {}
+        if read is True:
+            permissions["read"] = True
+        if write is True:
+            permissions["write"] = True
+        if len(permissions):
+            self._acl[name] = permissions
+        else:
+            self._acl.pop(name, None)
+
+
 class Function(ParseBase):
     ENDPOINT_ROOT = '/'.join((API_ROOT, 'functions'))
+
+    def __init__(self, name):
+        self.name = name
+
+    def __call__(self, **kwargs):
+        return self.POST('/' + self.name, **kwargs)
+
+class Job(ParseBase):
+    ENDPOINT_ROOT = '/'.join((API_ROOT, 'jobs'))
 
     def __init__(self, name):
         self.name = name
@@ -231,7 +440,7 @@ class ParseResource(ParseBase):
 
     def _init_attrs(self, args):
         for key, value in six.iteritems(args):
-            setattr(self, key, ParseType.convert_from_parse(value))
+            setattr(self, key, ParseType.convert_from_parse(key, value))
 
     def _to_native(self):
         return ParseType.convert_to_parse(self)
@@ -336,6 +545,27 @@ class Object(six.with_metaclass(ObjectMetaclass, ParseResource)):
             cls.ENDPOINT_ROOT = root
         return cls.ENDPOINT_ROOT
 
+    @classmethod
+    def schema(cls):
+        """Retrieves the class' schema."""
+        root = '/'.join([API_ROOT, 'schemas', cls.__name__])
+        schema = cls.GET(root)
+        return schema
+
+    @classmethod
+    def schema_delete_field(cls, key):
+        """Deletes a field."""
+        root = '/'.join([API_ROOT, 'schemas', cls.__name__])
+        payload = {
+            'className': cls.__name__,
+            'fields': {
+                key: {
+                    '__op': 'Delete'
+                }
+            }
+        }
+        cls.PUT(root, **payload)
+
     @property
     def _absolute_url(self):
         if not self.objectId:
@@ -360,6 +590,19 @@ class Object(six.with_metaclass(ObjectMetaclass, ParseResource)):
         self.__class__.PUT(self._absolute_url, **payload)
         self.__dict__[key] += amount
 
+    def remove(self, key):
+        """
+        Clear a column value in the object. Note that this happens immediately:
+        it does not wait for save() to be called.
+        """
+        payload = {
+            key: {
+                '__op': 'Delete'
+                }
+            }
+        self.__class__.PUT(self._absolute_url, **payload)
+        del self.__dict__[key]
+
     def removeRelation(self, key, className, objectsId):
         self.manageRelation('RemoveRelation', key, className, objectsId)
 
@@ -380,4 +623,12 @@ class Object(six.with_metaclass(ObjectMetaclass, ParseResource)):
                 }
             }
         self.__class__.PUT(self._absolute_url, **payload)
-        self.__dict__[key] = ''
+        # self.__dict__[key] = ''
+
+    def relation(self, key):
+        if not hasattr(self, key):
+            return Relation(parentObject=self, key=key)
+        try:
+            return getattr(self, key).with_parent(parentObject=self, key=key)
+        except:
+            raise ParseError("Column '%s' is not a Relation." % (key,))

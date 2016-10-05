@@ -15,7 +15,7 @@ import six
 from itertools import chain
 
 from parse_rest.core import ResourceRequestNotFound
-from parse_rest.connection import register, ParseBatcher
+from parse_rest.connection import register, ParseBatcher, SessionToken, MasterKey
 from parse_rest.datatypes import GeoPoint, Object, Function, Pointer
 from parse_rest.user import User
 from parse_rest import query
@@ -59,6 +59,14 @@ class GameScore(Object):
     pass
 
 
+class GameMap(Object):
+    pass
+
+
+class GameMode(Object):
+    pass
+
+
 class City(Object):
     pass
 
@@ -75,15 +83,19 @@ class TestObject(unittest.TestCase):
     def setUp(self):
         self.score = GameScore(score=1337, player_name='John Doe', cheat_mode=False)
         self.sao_paulo = City(name='São Paulo', location=GeoPoint(-23.5, -46.6167))
+        self.collected_item = CollectedItem(type="Sword", isAwesome=True)
 
     def tearDown(self):
         city_name = getattr(self.sao_paulo, 'name', None)
         game_score = getattr(self.score, 'score', None)
+        collected_item_type = getattr(self.collected_item, 'type', None)
         if city_name:
             ParseBatcher().batch_delete(City.Query.filter(name=city_name))
         if game_score:
             ParseBatcher().batch_delete(GameScore.Query.filter(score=game_score))
-
+        if collected_item_type:
+            ParseBatcher().batch_delete(CollectedItem.Query.filter(type=collected_item_type))
+        
     def testCanInitialize(self):
         self.assertEqual(self.score.score, 1337, 'Could not set score')
 
@@ -131,13 +143,18 @@ class TestObject(unittest.TestCase):
         self.score.increment('score')
         self.assertTrue(GameScore.Query.filter(score=previous_score + 1).exists(),
                      'Failed to increment score on backend')
+                     
+    def testCanRemoveField(self):
+        self.score.save()
+        self.score.remove('score')
+        self.assertTrue(GameScore.Query.filter(score=None).exists(),
+                     'Failed to remove score on backend')
 
     def testAssociatedObject(self):
         """test saving and associating a different object"""
-        collectedItem = CollectedItem(type="Sword", isAwesome=True)
-        collectedItem.save()
 
-        self.score.item = collectedItem
+        self.collected_item.save()
+        self.score.item = self.collected_item
         self.score.save()
 
         # get the object, see if it has saved
@@ -342,11 +359,50 @@ class TestQuery(unittest.TestCase):
         self.assertTrue(score.game.objectId)
         #nice to have - also check no more then one query is triggered
 
+    def testSelectRelatedArray(self):
+        scores = GameScore.Query.all()
+        game = Game.Query.all().limit(1)[0]
+
+        game.score_array = scores
+        game.save() # Saved an array of pointers in the game
+
+        game = Game.Query.filter(objectId=game.objectId).select_related('score_array')[0]
+        for score in game.score_array:
+            self.assertIsInstance(score, GameScore)
+            self.assertEqual(score.player_name, 'John Doe') # This would trigger a GET if select_related were not used.
+        #nice to have - also check no more then one query is triggered
+
     def testCanCompareDateInequality(self):
         today = datetime.datetime.today()
         tomorrow = today + datetime.timedelta(days=1)
         self.assertEqual(GameScore.Query.filter(createdAt__lte=tomorrow).count(), 5,
                          'Could not make inequality comparison with dates')
+
+    def testRelations(self):
+        """Make some maps, make a Game Mode that has many maps, find all maps
+        given a Game Mode"""
+        maps = [GameMap(name="map " + i) for i in ['a', 'b', 'c', 'd']]
+        ParseBatcher().batch_save(maps)
+
+        gm = GameMode(name='test mode')
+        gm.save()
+        gm.addRelation("maps", GameMap.__name__, [m.objectId for m in maps])
+
+        modes = GameMode.Query.all()
+        self.assertEqual(len(modes), 1)
+        mode = modes[0]
+        maps_for_mode = GameMap.Query.filter(maps__relatedTo=mode)
+        self.assertEqual(len(maps_for_mode), 4)
+
+        gm.delete()
+        ParseBatcher().batch_delete(maps)
+
+    def testQueryByRelated(self):
+        game_scores_direct = GameScore.Query.filter(game=self.game)
+        self.assertTrue(len(game_scores_direct) > 0)
+
+        game_scores_in = GameScore.Query.filter(game__in=[self.game])
+        self.assertEqual(len(game_scores_in), len(game_scores_direct))
 
 
 class TestFunction(unittest.TestCase):
@@ -356,6 +412,10 @@ class TestFunction(unittest.TestCase):
 
         cloud_function_dir = os.path.join(os.path.split(__file__)[0], 'cloudcode')
         os.chdir(cloud_function_dir)
+        if not os.path.exists("config"):
+            os.makedirs("config")
+        if not os.path.exists("public"):
+            os.makedirs("public")
         # write the config file
         with open("config/global.json", "w") as outf:
             outf.write(GLOBAL_JSON_TEXT % (settings_local.APPLICATION_ID,
@@ -473,6 +533,28 @@ class TestUser(unittest.TestCase):
         g.save()
         self.assertEqual(1, len(Game.Query.filter(creator=user)))
 
+    def testCanGetCurrentUser(self):
+        user = User.signup(self.username, self.password)
+        self.assertIsNotNone(user.sessionToken)
+
+        register(
+            getattr(settings_local, 'APPLICATION_ID'),
+            getattr(settings_local, 'REST_API_KEY'),
+            session_token=user.sessionToken
+        )
+
+        current_user = User.current_user()
+
+        register(
+            getattr(settings_local, 'APPLICATION_ID'),
+            getattr(settings_local, 'REST_API_KEY'),
+            master_key=getattr(settings_local, 'MASTER_KEY')
+        )
+        
+        self.assertIsNotNone(current_user)
+        self.assertEqual(current_user.sessionToken, user.sessionToken)
+        self.assertEqual(current_user.username, user.username)
+
 
 class TestPush(unittest.TestCase):
     """
@@ -495,6 +577,34 @@ class TestPush(unittest.TestCase):
         Push.alert({"alert": "The Mets scored! The game is now tied 1-1.",
                     "badge": "Increment", "title": "Mets Score"},
                    channels=["Mets"], where={"scores": True})
+
+
+class TestSessionToken(unittest.TestCase):
+    """
+    Test SessionToken class enter and exit.
+    """
+    def get_access_keys(self):
+        from parse_rest.connection import ACCESS_KEYS
+        return ACCESS_KEYS
+
+    def testWithSessionToken(self):
+        with SessionToken(token='asdf'):
+            self.assertIn('session_token', self.get_access_keys())
+        self.assertNotIn('session_token', self.get_access_keys())
+
+
+class TestMasterKey(unittest.TestCase):
+    """
+    Test MasterKey class enter and exit.
+    """
+    def get_access_keys(self):
+        from parse_rest.connection import ACCESS_KEYS
+        return ACCESS_KEYS
+
+    def testWithMasterKey(self):
+        with MasterKey(master_key='asdf'):
+            self.assertIn('master_key', self.get_access_keys() )
+        self.assertNotIn('master_key', self.get_access_keys() )
 
 
 def run_tests():

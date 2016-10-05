@@ -16,12 +16,21 @@ import copy
 import collections
 
 
-class QueryResourceDoesNotExist(Exception):
+class QueryError(Exception):
+    '''Query error base class'''
+
+    def __init__(self, message, status_code=None):
+        super(QueryError, self).__init__(message)
+        if status_code:
+            self.status_code = status_code
+
+
+class QueryResourceDoesNotExist(QueryError):
     '''Query returned no results'''
     pass
 
 
-class QueryResourceMultipleResultsReturned(Exception):
+class QueryResourceMultipleResultsReturned(QueryError):
     '''Query was supposed to return unique result, returned more than one'''
     pass
 
@@ -56,7 +65,7 @@ class QueryManager(object):
 class Queryset(object):
 
     OPERATORS = [
-        'lt', 'lte', 'gt', 'gte', 'ne', 'in', 'nin', 'exists', 'select', 'dontSelect', 'all', 'relatedTo', 'nearSphere'
+        'lt', 'lte', 'gt', 'gte', 'ne', 'in', 'nin', 'exists', 'select', 'dontSelect', 'all', 'regex', 'relatedTo', 'nearSphere'
     ]
 
     @staticmethod
@@ -126,7 +135,7 @@ class Queryset(object):
             if operator is None:
                 q._where[attr] = parse_value
             elif operator == 'relatedTo':
-                q._where['$' + operator] = parse_value
+                q._where['$' + operator] = {'object': parse_value, 'key': attr}
             else:
                 if not isinstance(q._where[attr], dict):
                     q._where[attr] = {}
@@ -143,6 +152,11 @@ class Queryset(object):
         q._options['skip'] = int(value)
         return q
 
+    def keys(self, *fields):
+        q = copy.deepcopy(self)
+        q._options['keys'] = ','.join(fields)
+        return q
+        
     def order_by(self, order, descending=False):
         q = copy.deepcopy(self)
         # add a minus sign before the order value if descending == True
@@ -163,9 +177,15 @@ class Queryset(object):
     def get(self):
         results = self._fetch()
         if len(results) == 0:
-            raise QueryResourceDoesNotExist
+            error_message = 'Query against %s returned no results' % (
+                    self._manager.model_class.ENDPOINT_ROOT)
+            raise QueryResourceDoesNotExist(error_message,
+                                            status_code=404)
         if len(results) >= 2:
-            raise QueryResourceMultipleResultsReturned
+            error_message = 'Query against %s returned multiple results' % (
+                    self._manager.model_class.ENDPOINT_ROOT)
+            raise QueryResourceMultipleResultsReturned(error_message,
+                                                       status_code=404)
         return results[0]
 
     def __repr__(self):

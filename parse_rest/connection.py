@@ -13,18 +13,22 @@
 
 from six.moves.urllib.request import Request, urlopen
 from six.moves.urllib.error import HTTPError
-from six.moves.urllib.parse import urlencode
+from six.moves.urllib.parse import urlencode, urlparse
 
 import json
 
 from parse_rest import core
 
-API_ROOT = 'https://api.parse.com/1'
+import os
+
+API_ROOT = os.environ.get('PARSE_API_ROOT') or 'https://api.parse.com/1'
+
 ACCESS_KEYS = {}
 
 
 # Connection can sometimes hang forever on SSL handshake
 CONNECTION_TIMEOUT = 60
+
 
 def register(app_id, rest_key, **kw):
     global ACCESS_KEYS
@@ -33,6 +37,30 @@ def register(app_id, rest_key, **kw):
         'rest_key': rest_key
         }
     ACCESS_KEYS.update(**kw)
+
+
+class SessionToken:
+    def __init__(self, token):
+        global ACCESS_KEYS
+        self.token = token
+
+    def __enter__(self):
+        ACCESS_KEYS.update({'session_token': self.token})
+
+    def __exit__(self, type, value, traceback):
+        del ACCESS_KEYS['session_token']
+
+
+class MasterKey:
+    def __init__(self, master_key):
+        global ACCESS_KEYS
+        self.master_key = master_key
+
+    def __enter__(self):
+        return ACCESS_KEYS.update({'master_key': self.master_key})
+
+    def __exit__(self, type, value, traceback):
+        del ACCESS_KEYS['master_key']
 
 
 def master_key_required(func):
@@ -45,12 +73,16 @@ def master_key_required(func):
         func(obj, *args, **kw)
     return ret
 
+# Using this as "default=" argument solve the problem with Datetime object not being JSON serializable
+def date_handler(obj):
+    return obj.isoformat() if hasattr(obj, 'isoformat') else obj
+
 
 class ParseBase(object):
     ENDPOINT_ROOT = API_ROOT
 
     @classmethod
-    def execute(cls, uri, http_verb, extra_headers=None, batch=False, **kw):
+    def execute(cls, uri, http_verb, extra_headers=None, batch=False, _body=None, **kw):
         """
         if batch == False, execute a command with the given parameters and
         return the response JSON.
@@ -58,7 +90,8 @@ class ParseBase(object):
         command.
         """
         if batch:
-            ret = {"method": http_verb, "path": uri.split("parse.com", 1)[1]}
+            urlsplitter = urlparse(API_ROOT).netloc
+            ret = {"method": http_verb, "path": uri.split(urlsplitter, 1)[1]}
             if kw:
                 ret["body"] = kw
             return ret
@@ -70,21 +103,29 @@ class ParseBase(object):
         rest_key = ACCESS_KEYS.get('rest_key')
         master_key = ACCESS_KEYS.get('master_key')
 
-        headers = extra_headers or {}
         url = uri if uri.startswith(API_ROOT) else cls.ENDPOINT_ROOT + uri
-        data = kw and json.dumps(kw) or "{}"
+        if _body is None:
+            data = kw and json.dumps(kw, default=date_handler) or "{}"
+        else:
+            data = _body
         if http_verb == 'GET' and data:
             url += '?%s' % urlencode(kw)
             data = None
         else:
             data = data.encode('utf-8')
 
-        request = Request(url, data, headers)
-        request.add_header('Content-type', 'application/json')
-        request.add_header('X-Parse-Application-Id', app_id)
-        request.add_header('X-Parse-REST-API-Key', rest_key)
+        headers = {
+            'Content-type': 'application/json',
+            'X-Parse-Application-Id': app_id,
+            'X-Parse-REST-API-Key': rest_key
+        }
+        headers.update(extra_headers or {})
 
-        if master_key: # and 'X-Parse-Session-Token' not in headers.keys():
+        request = Request(url, data, headers)
+
+        if ACCESS_KEYS.get('session_token'):
+            request.add_header('X-Parse-Session-Token', ACCESS_KEYS.get('session_token'))
+        elif master_key:
             request.add_header('X-Parse-Master-Key', master_key)
 
         request.get_method = lambda: http_verb
@@ -118,6 +159,11 @@ class ParseBase(object):
     def DELETE(cls, uri, **kw):
         return cls.execute(uri, 'DELETE', **kw)
 
+    @classmethod
+    def drop(cls):
+        return cls.POST("%s/schemas/%s" % (API_ROOT, cls.__name__),
+                        _method="DELETE", _ClientVersion="browser")
+
 
 class ParseBatcher(ParseBase):
     """Batch together create, update or delete operations"""
@@ -137,8 +183,16 @@ class ParseBatcher(ParseBase):
         responses = self.execute("", "POST", requests=queries)
         # perform the callbacks with the response data (updating the existing
         # objets, etc)
+
+        batched_errors = []
         for callback, response in zip(callbacks, responses):
-            callback(response["success"])
+            if "success" in response:
+                callback(response["success"])
+            else:
+                batched_errors.append(response["error"])
+
+        if batched_errors:
+            raise core.ParseBatchError(batched_errors)
 
     def batch_save(self, objects):
         """save a list of objects in one operation"""

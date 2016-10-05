@@ -1,3 +1,10 @@
+Note: As of May 13, 2016, this repository (`milesrichardson/ParsePy)` is the
+most up-to-date and active python client for the Parse API. It supports self-hosted
+`parse-server` via the REST API. Note that some features will not work with parse-server,
+if they are not supported by the REST API (e.g. push).
+
+See the section below, "using with self-hosted parse-server," for instructions.
+
 parse_rest
 ==========
 
@@ -12,7 +19,7 @@ parse_rest
   - Cloud code integration
   - Installation querying
   - push
-  - **PLANNED/TODO**: Roles/ACLs**
+  - Roles/ACLs**
   - **PLANNED/TODO**: Image/File type support
 
 
@@ -25,12 +32,41 @@ Installation
 The easiest way to install this package is by downloading or
 cloning this repository:
 
-    pip install git+https://github.com/dgrtwo/ParsePy.git
+    pip install git+https://github.com/milesrichardson/ParsePy.git
 
 Note: The version on [PyPI](http://pypi.python.org/pypi) is not
 up-to-date. The code is still under lots of changes and the stability
 of the library API - though improving - is not guaranteed. Please
 file any issues that you may find if documentation/application.
+
+
+Using with self-hosted `parse-server`
+-------------
+
+To use the library with self-hosted parse-server, set the environment variable
+`PARSE_API_ROOT` before importing the module.
+
+Example:
+
+~~~~~ {python}
+import os
+os.environ["PARSE_API_ROOT"] = "http://your_server.com:1337/parse"
+
+# Everything else same as usual
+
+from parse_rest.datatypes import Function, Object, GeoPoint
+from parse_rest.connection import register
+from parse_rest.query import QueryResourceDoesNotExist
+from parse_rest.connection import ParseBatcher
+from parse_rest.core import ResourceRequestBadRequest, ParseError
+
+APPLICATION_ID = '...'
+REST_API_KEY = '...'
+MASTER_KEY = '...'
+
+register(APPLICATION_ID, REST_API_KEY, master_key=MASTER_KEY)
+~~~~~
+
 
 Testing
 -------
@@ -54,8 +90,11 @@ in the app and may accidentally replace or change existing objects.
 
 You can then test the installation by running the following command:
 
-    python -m 'parse_rest.tests'
+    # test all
+    python -m unittest parse_rest.tests
 
+    # or test individually
+    python -m unittest parse_rest.tests.TestObject.testCanCreateNewObject
 
 Usage
 -----------
@@ -65,7 +104,7 @@ register your access credentials. You can do so by calling
 `parse_rest.connection.register`.
 
 Before getting to code, a word of caution. You need to consider how your application is
-meant to be deployed. Parse identifies your application though
+meant to be deployed. Parse identifies your application through
 different keys (available from your Parse dashboard) that are used in
 every request done to their servers.
 
@@ -123,7 +162,22 @@ class GameScore(Object):
     pass
 ~~~~~
 
-And then instantiate it with your parameters:
+You can also create an Object subclass by string name, with the `Object.factory`
+method:
+
+~~~~~ {python}
+from parse_rest.datatypes import Object
+
+myClassName = "GameScore"
+myClass = Object.factory(myClassName)
+
+print myClass
+# <class 'parse_rest.datatypes.GameScore'>
+print myClass.__name__
+# GameScore
+~~~~~
+
+You can then instantiate your new class with some parameters:
 
 ~~~~~ {python}
 gameScore = GameScore(score=1337, player_name='John Doe', cheat_mode=False)
@@ -239,6 +293,53 @@ You can also mix `save` and `delete` operations in the same query as follows (no
 batcher.batch([score1.save, score2.save, score3.delete])
 ~~~~~
 
+If an error occurs during one or multiple of the operations, it will not affect
+the execution of the remaining operations. Instead, the `batcher.batch_save` or
+`batcher.batch_delete` or `batcher.batch` will raise a `ParseBatchError`
+(child of `ParseError`) exception with `.message` set to a *list* of the errors
+encountered. For example:
+
+~~~~~ {python}
+# Batch save a list of two objects:
+#   dupe_object is a duplicate violating a unique key constraint
+#   dupe_object2 is a duplicate violating a unique key constraint
+#   new_object is a new object satisfying the unique key constraint
+#
+# dupe_object and dupe_object2 will fail to save, and new_object will save successfully
+
+dupe_object = list(MyClass.Query.all().limit(2))[0]
+dupe_object2 = list(MyClass.Query.all().limit(2))[1]
+new_object = MyClass(some_column=11111)
+objects = [dupe_object, dupe_object2, new_object]
+
+batcher = ParseBatcher()
+batcher.batch_save(objects)
+~~~~~
+
+will raise an exception:
+
+~~~~~ {python}
+Traceback (most recent call last):
+  File "<console>", line 1, in <module>
+  File "/Users/miles/ParsePy/parse_rest/connection.py", line 199, in batch_save
+    self.batch(o.save for o in objects)
+  File "/Users/miles/ParsePy/parse_rest/connection.py", line 195, in batch
+    raise core.ParseBatchError(batched_errors)
+
+ParseBatchError: [{u'code': 11000, u'error': u'E11000 duplicate key error index: myapp.MyClass.$my_column_1 dup key: { : 555555 }'}, {u'code': 11000, u'error': u'E11000 duplicate key error index: myapp.MyClass.$my_column_1 dup key: { : 44444 }'}]
+~~~~~
+
+And `CRUCIALLY`, the objectId field of the NON-duplicate object will be correctly set:
+
+~~~~~ {python}
+>>> #batch_save as above...
+>>> print objects
+[<MyClass:None>, <MyClass:None>, <MyClass:gOHuhPbGZJ>]
+~~~~~
+
+Therefore, one way to tell which objects saved successfully after a batch save operation
+is to check which objects have `objectId` set.
+
 Querying
 --------
 
@@ -352,6 +453,59 @@ for post in posts_by_joe:
 **TODO**: Slicing of Querysets
 
 
+Relations
+---------
+
+A Relation is field that contains references to multiple objects.
+You can query this subset of objects.
+
+(Note that Parse's relations are "one sided" and don't involve a join table.  [See the docs.](https://parse.com/docs/js/guide#relations-many-to-many))
+
+For example, if we have Game and GameScore classes, and one game
+can have multiple GameScores, you can use relations to associate
+those GameScores with a Game.
+
+~~~~~ {python}
+game = Game(name="3-way Battle")
+game.save()
+score1 = GameScore(player_name='Ronald', score=100)
+score2 = GameScore(player_name='Rebecca', score=140)
+score3 = GameScore(player_name='Sara', score=190)
+relation = game.relation('scores')
+relation.add([score1, score2, score3])
+~~~~~
+
+A Game gets added, three GameScores get added, and three relations
+are created associating the GameScores with the Game.
+
+To retreive the related scores for a game, you use query() to get a
+Queryset for the relation.
+
+~~~~~ {python}
+scores = relation.query()
+for gamescore in scores:
+    print gamescore.player_name, gamescore.score
+~~~~~
+
+The query is limited to the objects previously added to the
+relation.
+
+~~~~~ {python}
+scores = relation.query().order_by('score', descending=True)
+for gamescore in scores:
+    print gamescore.player_name, gamescore.score
+~~~~~
+
+To remove objects from a relation, you use remove(). This example
+removes all the related objects.
+
+~~~~~ {python}
+scores = relation.query()
+for gamescore in scores:
+    relation.remove(gamescore)
+~~~~~
+
+
 Users
 -----
 
@@ -390,6 +544,26 @@ u.highscore = 300
 u.save()
 u.delete()
 ~~~~~
+
+To get the current user from a Parse session:
+
+~~~~~ {python}
+from parse_rest.connection import SessionToken, register
+
+# Acquire a valid parse session somewhere
+# Example: token = request.session.get('session_token')
+
+# Method 1: Using a `with` statement
+# Do this to isolate use of session token in this block only
+with SessionToken(token):
+    me = User.current_user()
+
+# Method 2: register your parse connection with `session_token` parameter
+# Do this to use the session token for all subsequent queries
+register(PARSE_APPID, PARSE_APIKEY, session_token=token)
+me = User.current_user()
+~~~~~
+
 
 Push
 ---------------
@@ -467,4 +641,66 @@ star_func(movie="The Matrix")
 ~~~~~
 
 
-That's it! This is a first try at a Python library for Parse, and is probably not bug-free. If you run into any issues, please get in touch -- dgrtwo@princeton.edu. Thanks!
+ACLs
+---------------
+The ACL for an object can be updated using the `parse_rest.datatypes.ACL` class. This class provides three methods for setting an ACL: set_user, set_role, and set_default. For example, using the User and gameScore examples from above:
+~~~~~ {python}
+from parse_rest.datatypes import ACL
+from parse_rest.user import User
+
+u = User.login('dhelmet', '12345')
+
+gameScore.ACL.set_user(u, read=True, write=True)
+# allows user 'dhelmet' to read and write to gameScore
+gameScore.ACL.set_default(read=True)
+# allows public to read but not write to gameScore
+gameScore.ACL.set_role('moderators', read=True, write=True)
+# allows role 'moderators' to read and write to gameScore. Can alternatively pass the role object instead of the
+# role name. See below for more info on Roles.
+gameScore.save()
+~~~~~
+
+
+Roles
+---------------
+You can create, update or delete roles as well, using the `parse_rest.role.Role` class. Creating a role requires you to pass a name and an ACL to Role.
+~~~~~ {python}
+from parse_rest.role import Role
+from parse_rest.datatypes import ACL
+
+admin_role = Role(name='moderators')
+admin_role.ACL.set_default(read=True)
+admin_role.save()
+~~~~~
+
+This, for example, creates a role with the name 'moderators', with an ACL that allows the public to read but not write to this role object.
+
+
+Session Tokens
+---------------
+When querying or updating an object protected by an ACL, parse.com requires the session token of the user with read and write privileges, respectively. You can pass the session token to such queries and updates by using the `parse_rest.connection.SessionToken` class.
+
+~~~~~ {python}
+from parse_rest.connection import SessionToken
+from parse_rest.user import User
+
+u = User.login('dhelmet', '12345')
+token = u.sessionToken
+
+with SessionToken(token):
+    collectedItem = CollectedItem.Query.get(type="Sword") # Get a collected item, Sword, that is protected by ACL
+    print collectedItem
+~~~~~
+
+Assuming the CollectedItem 'Sword' is read-protected from the public by an ACL and is readable only by the user, SessionToken allows the user to bypass the ACL and get the 'Sword' item.
+
+Elevating Access to Master
+--------------------------
+Sometimes it is useful to only allow privileged use of the master key for specific uses.
+
+~~~~~ {python}
+from parse_rest.connection import MasterKey
+
+with MasterKey('master key'):
+    # do privileged calls
+~~~~~

@@ -75,21 +75,26 @@ class User(ParseResource):
         session_header = {'X-Parse-Session-Token': self.sessionToken}
         return User.DELETE(self._absolute_url, extra_headers=session_header)
 
-    @staticmethod
-    def signup(username, password, **kw):
+    @classmethod
+    def signup(cls, username, password, **kw):
         response_data = User.POST('', username=username, password=password, **kw)
         response_data.update({'username': username})
-        return User(**response_data)
+        return cls(**response_data)
 
-    @staticmethod
-    def login(username, passwd):
+    @classmethod
+    def login(cls, username, passwd):
         login_url = '/'.join([API_ROOT, 'login'])
-        return User(**User.GET(login_url, username=username, password=passwd))
+        return cls(**User.GET(login_url, username=username, password=passwd))
 
-    @staticmethod
-    def login_auth(auth):
+    @classmethod
+    def login_auth(cls, auth):
         login_url = User.ENDPOINT_ROOT
-        return User(**User.POST(login_url, authData=auth))
+        return cls(**User.POST(login_url, authData=auth))
+
+    @classmethod
+    def current_user(cls):
+        user_url = '/'.join([API_ROOT, 'users/me'])
+        return cls(**User.GET(user_url))
 
     @staticmethod
     def request_password_reset(email):
@@ -113,6 +118,28 @@ class User(ParseResource):
 
     def __repr__(self):
         return '<User:%s (Id %s)>' % (getattr(self, 'username', None), self.objectId)
+    
+    def removeRelation(self, key, className, objectsId):
+        self.manageRelation('RemoveRelation', key, className, objectsId)
+
+    def addRelation(self, key, className, objectsId):
+        self.manageRelation('AddRelation', key, className, objectsId)
+
+    def manageRelation(self, action, key, className, objectsId):
+        objects = [{
+                    "__type": "Pointer",
+                    "className": className,
+                    "objectId": objectId
+                    } for objectId in objectsId]
+
+        payload = {
+            key: {
+                 "__op": action,
+                 "objects": objects
+                }
+            }
+        self.__class__.PUT(self._absolute_url, **payload)
+        self.__dict__[key] = ''
 
 
 User.Query = QueryManager(User)
