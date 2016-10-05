@@ -13,7 +13,7 @@
 
 
 from parse_rest.core import ResourceRequestLoginRequired, ParseError
-from parse_rest.connection import API_ROOT
+from parse_rest.connection import API_ROOT, ACCESS_KEYS
 from parse_rest.datatypes import ParseResource, ParseType
 from parse_rest.query import QueryManager
 
@@ -21,7 +21,9 @@ from parse_rest.query import QueryManager
 def login_required(func):
     '''decorator describing User methods that need to be logged in'''
     def ret(obj, *args, **kw):
-        if not hasattr(obj, 'sessionToken'):
+        conn = ACCESS_KEYS
+        if not (conn and conn.get('master_key')) and \
+                not hasattr(obj, 'sessionToken'):
             message = '%s requires a logged-in session' % func.__name__
             raise ResourceRequestLoginRequired(message)
         return func(obj, *args, **kw)
